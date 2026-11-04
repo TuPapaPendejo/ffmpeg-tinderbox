@@ -1,109 +1,74 @@
-name: Windows Cross Compiled
+name: FFmpeg Windows x64 (Master + FDK AAC + xHE-AAC)
 
 on:
   push:
-    branches-ignore:
-      - 'dependabot/**'
-
+    branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ffmpeg-win64-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build_targets:
-    name: Build target-variant image
-    runs-on: ubuntu-26.04
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [win64]
-        variant: [nonfree]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Create and Boot docker-container Driver
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config-inline: |
-            [worker.oci]
-            max-parallelism = 2
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.dodosolsollalasol }}
-
-      - name: Generate Dockerfile
-        run: ./generate.sh ${{ matrix.target }} ${{ matrix.variant }}
-
-      - name: Image Name
-        id: imagename
-        run: |
-          IMG="ghcr.io/${GITHUB_ACTOR,,}/${{ matrix.target }}-${{ matrix.variant }}"
-          echo "image=${IMG/ /-}:latest" >> "$GITHUB_OUTPUT"
-          echo "cache=${IMG/ /-}:cache" >> "$GITHUB_OUTPUT"
-
-      - name: Build variant image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          outputs: type=registry,oci-mediatypes=true,compression=zstd,compression-level=7
-          cache-from: type=registry,ref=${{ steps.imagename.outputs.cache }}
-          cache-to: type=registry,ref=${{ steps.imagename.outputs.cache }},mode=max,oci-mediatypes=true,compression=zstd,compression-level=7
-          tags: ${{ steps.imagename.outputs.image }}
-          provenance: false
-
-  ffmpeg_latest:
-    name: Get FFmpeg latest commit
-    needs: build_targets
-    runs-on: ubuntu-26.04
-    outputs:
-      commit: ${{ steps.sha.outputs.ffmpeg_commit }}
-    steps:
-      - name: Get FFmpeg latest commit
-        id: sha
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          sha=$(gh api repos/FFmpeg/FFmpeg/commits/master --jq '.sha')
-          echo "ffmpeg_commit=${sha}" >> "$GITHUB_OUTPUT"
-
   build_ffmpeg:
-    name: Build ffmpeg
-    needs: ffmpeg_latest
+    name: Build win64 ${{ matrix.variant }}
     runs-on: ubuntu-26.04
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         target: [win64]
         variant: [nonfree, nonfree-shared]
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.dodosolsollalasol }}
-
-      - name: Build ffmpeg
-        run: ./build.sh ${{ matrix.target }} ${{ matrix.variant }}
+      - name: Resolve latest FFmpeg master commit
+        id: ffmpeg
         env:
-          FFMPEG_COMMIT: ${{ needs.ffmpeg_latest.outputs.commit }}
-
-      - name: Replace spaces in artifact name
-        id: artifact
+          GH_TOKEN: ${{ github.token }}
         run: |
-          REF="${{ matrix.target }}-${{ matrix.variant }}"
-          echo "name=${REF// /-}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          SHA="$(gh api repos/FFmpeg/FFmpeg/commits/master --jq '.sha')"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Building FFmpeg master commit: $SHA"
 
-      - name: Upload artifact
+      - name: Build local Docker toolchain and dependency image
+        run: |
+          set -euo pipefail
+          ./makeimage.sh "${{ matrix.target }}" "${{ matrix.variant }}"
+
+      - name: Compile FFmpeg
+        env:
+          FFMPEG_COMMIT: ${{ steps.ffmpeg.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ./build.sh "${{ matrix.target }}" "${{ matrix.variant }}"
+
+      - name: Verify generated package
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/*.tar.zst)
+          if (( ${#files[@]} != 1 )); then
+            echo "Expected exactly one .tar.zst package; found ${#files[@]}"
+            find artifacts -maxdepth 2 -type f -printf '%p (%s bytes)\n' || true
+            exit 1
+          fi
+          test -s "${files[0]}"
+          zstd -t "${files[0]}"
+          sha256sum "${files[0]}" > artifacts/SHA256SUMS.txt
+          ls -lh artifacts
+
+      - name: Upload FFmpeg package
         uses: actions/upload-artifact@v7
         with:
-          name: ffmpeg-${{ steps.artifact.outputs.name }}
+          name: ffmpeg-${{ matrix.target }}-${{ matrix.variant }}
           path: artifacts/
-          retention-days: 1
-          archive: false
+          if-no-files-found: error
+          retention-days: 14
