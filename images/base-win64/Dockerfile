@@ -39,6 +39,7 @@ RUN <<EOF
     git config --system user.email "builder@localhost"
     git config --system user.name "Builder"
     git config --system advice.detachedHead false
+    git config --system http.version HTTP/1.1
 EOF
 
 RUN --mount=src=.,dst=/input <<EOF
